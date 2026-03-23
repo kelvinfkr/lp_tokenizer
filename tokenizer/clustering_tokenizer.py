@@ -190,11 +190,13 @@ class ClusteringTokenizer:
         max_ngram: int = 8,
         top_k_factor: int = 10,
         device: Optional[str] = None,
+        cluster: bool = False,
     ):
-        self.vocab_size  = vocab_size
-        self.min_ngram   = min_ngram
-        self.max_ngram   = max_ngram
+        self.vocab_size   = vocab_size
+        self.min_ngram    = min_ngram
+        self.max_ngram    = max_ngram
         self.top_k_factor = top_k_factor
+        self.cluster      = cluster
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -212,13 +214,22 @@ class ClusteringTokenizer:
         """
         Build vocabulary from a text corpus.
 
-        Steps:
-          1. Count n-gram frequencies (GPU)
-          2. Keep top-K candidates
+        When cluster=False (default, fast):
+          1. Count n-gram frequencies (GPU bitwise packing + torch.sort + topk)
+          2. Directly select top-(vocab_size - 256 - 1) n-grams by frequency
+          3. Build final vocab
+
+        When cluster=True (slow, original pipeline):
+          1. Count n-gram frequencies
+          2. Keep top-K candidates (top_k_factor × overshoot)
           3. Compute MinHash signatures (GPU)
-          4. LSH clustering
-          5. Merge clusters → select representative
+          4. LSH clustering → union-find
+          5. Select cluster representatives
           6. Build final vocab
+
+        The clustering step is skipped by default because in practice the
+        position-aware Jaccard threshold (≥0.8) merges very few pairs among
+        the top-K high-frequency byte n-grams, making it an expensive no-op.
         """
         if isinstance(text, str):
             data = text.encode("utf-8", errors="replace")
@@ -226,73 +237,79 @@ class ClusteringTokenizer:
             data = text
 
         if verbose:
+            mode = "cluster=True" if self.cluster else "cluster=False (fast)"
             print(f"[ClusteringTokenizer] training on {len(data)/1e6:.1f} MB corpus")
-            print(f"  device={self.device}, vocab_size={self.vocab_size}")
+            print(f"  device={self.device}, vocab_size={self.vocab_size}, {mode}")
 
-        # ── Step 1: count n-gram frequencies ─────────────
-        if verbose:
-            print("  Step 1/4: counting n-gram frequencies ...")
-        freq = self._count_ngrams_gpu(data)
-        if verbose:
-            print(f"    total unique n-grams: {len(freq)}")
+        n_content_tokens = self.vocab_size - self.BYTE_FALLBACK_SIZE - 1  # -1 for EOT
 
-        # ── Step 2: top-K candidates ──────────────────────
-        target_k = min(
-            (self.vocab_size - self.BYTE_FALLBACK_SIZE) * self.top_k_factor,
-            len(freq),
-        )
-        if verbose:
-            print(f"  Step 2/4: keeping top-{target_k} candidates ...")
-        candidates_sorted = sorted(freq.items(), key=lambda x: -x[1])[:target_k]
-        candidates  = [c for c, _ in candidates_sorted]
-        cand_freqs  = {c: f for c, f in candidates_sorted}
+        if not self.cluster:
+            # ── Fast path: count → direct top-K ──────────────
+            # top_k_factor=1: keep exactly n_content_tokens per n-gram length;
+            # no need to over-sample for a clustering step that doesn't run.
+            if verbose:
+                print("  Step 1/2: counting n-gram frequencies (GPU) ...")
+            freq = self._count_ngrams_gpu(data, keep_k=n_content_tokens)
+            if verbose:
+                print(f"    unique n-grams retained: {len(freq)}")
+                print(f"  Step 2/2: selecting top-{n_content_tokens} tokens ...")
+            top_sorted = sorted(freq.items(), key=lambda x: -x[1])
+            top_reps = [tok for tok, _ in top_sorted[:n_content_tokens]]
 
-        # ── Step 3: MinHash signatures ────────────────────
-        if verbose:
-            print(f"  Step 3/4: computing MinHash signatures on {self.device} ...")
-        sigs = compute_minhash_signatures_gpu(candidates, self.device)
-        if verbose:
-            print(f"    signatures shape: {tuple(sigs.shape)}")
+        else:
+            # ── Full pipeline: count → MinHash → LSH → union-find ──
+            if verbose:
+                print("  Step 1/4: counting n-gram frequencies ...")
+            keep_k = (self.vocab_size - self.BYTE_FALLBACK_SIZE) * self.top_k_factor
+            freq = self._count_ngrams_gpu(data, keep_k=keep_k)
+            if verbose:
+                print(f"    total unique n-grams: {len(freq)}")
 
-        # ── Step 4: LSH clustering ────────────────────────
-        if verbose:
-            print("  Step 4/4: LSH clustering & vocab construction ...")
-        buckets = lsh_buckets_gpu(sigs, self.device)
+            target_k = min(keep_k, len(freq))
+            if verbose:
+                print(f"  Step 2/4: keeping top-{target_k} candidates ...")
+            candidates_sorted = sorted(freq.items(), key=lambda x: -x[1])[:target_k]
+            candidates = [c for c, _ in candidates_sorted]
+            cand_freqs = {c: f for c, f in candidates_sorted}
 
-        # Union-Find to merge overlapping bucket memberships
-        parent = list(range(len(candidates)))
+            if verbose:
+                print(f"  Step 3/4: computing MinHash signatures on {self.device} ...")
+            sigs = compute_minhash_signatures_gpu(candidates, self.device)
+            if verbose:
+                print(f"    signatures shape: {tuple(sigs.shape)}")
 
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
+            if verbose:
+                print("  Step 4/4: LSH clustering & vocab construction ...")
+            buckets = lsh_buckets_gpu(sigs, self.device)
 
-        def union(x, y):
-            px, py = find(x), find(y)
-            if px != py:
-                parent[px] = py
+            parent = list(range(len(candidates)))
 
-        for members in buckets.values():
-            for m in members[1:]:
-                union(members[0], m)
+            def find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
 
-        # Group by cluster root
-        clusters: dict[int, list[bytes]] = defaultdict(list)
-        for i, c in enumerate(candidates):
-            clusters[find(i)].append(c)
+            def union(x, y):
+                px, py = find(x), find(y)
+                if px != py:
+                    parent[px] = py
 
-        # From each cluster pick the most-frequent candidate
-        representatives: list[tuple[bytes, int]] = []
-        for members in clusters.values():
-            best = max(members, key=lambda c: cand_freqs[c])
-            representatives.append((best, cand_freqs[best]))
+            for members in buckets.values():
+                for m in members[1:]:
+                    union(members[0], m)
 
-        # Sort by frequency, take top (vocab_size - BYTE_FALLBACK_SIZE - 1) tokens
-        # The -1 reserves slot for EOT
-        n_content_tokens = self.vocab_size - self.BYTE_FALLBACK_SIZE - 1
-        representatives.sort(key=lambda x: -x[1])
-        top_reps = [tok for tok, _ in representatives[:n_content_tokens]]
+            clusters: dict[int, list[bytes]] = defaultdict(list)
+            for i, c in enumerate(candidates):
+                clusters[find(i)].append(c)
+
+            representatives: list[tuple[bytes, int]] = []
+            for members in clusters.values():
+                best = max(members, key=lambda c: cand_freqs[c])
+                representatives.append((best, cand_freqs[best]))
+
+            representatives.sort(key=lambda x: -x[1])
+            top_reps = [tok for tok, _ in representatives[:n_content_tokens]]
 
         # ── Build final vocabulary ────────────────────────
         # Layout:
@@ -327,26 +344,28 @@ class ClusteringTokenizer:
             print(f"  Done! vocab_size={len(self._vocab)}, "
                   f"avg_token_len={avg_len:.2f} bytes")
 
-    def _count_ngrams_gpu(self, data: bytes) -> dict[bytes, int]:
+    def _count_ngrams_gpu(self, data: bytes, keep_k: int | None = None) -> dict[bytes, int]:
         """
-        Count byte n-gram frequencies using numpy (CPU).
+        Count byte n-gram frequencies using GPU bitwise packing + torch.sort.
 
-        Why numpy instead of GPU here:
-        - For large n (n=7,8) most n-grams in a corpus are unique, so
-          torch.unique returns nearly as many rows as input → the subsequent
-          Python dict loop still iterates O(L) times per chunk.
-        - numpy np.unique on the full corpus at once is a single C-level
-          radix sort, faster than 13 round-trips (GPU sort + CPU transfer).
-        - We use np.argpartition to keep only the top-K candidates before
-          converting to Python bytes, so the final Python loop is O(K) not O(L).
+        Algorithm per n-gram length n:
+          1. Pack: keys[i] = data[i] | data[i+1]<<8 | ... | data[i+n-1]<<(8*(n-1))
+             → (L,) int64 on GPU, no intermediate (L,8) buffer needed
+          2. torch.sort: GPU radix sort, ~5-10× faster than numpy mergesort
+          3. Run-length encoding via diff detection → (unique_keys, counts)
+          4. torch.topk on GPU: keep only keep_k entries before CPU transfer
+          5. Python loop is O(keep_k), not O(unique n-grams)
 
-        Memory: (L, 8) uint8 ≈ corpus_size × 8 bytes  (≤ 400 MB for 50 MB corpus)
+        Memory per n: 2 × (L,) int64 ≈ 2 × corpus_size × 8 bytes
+                      = ~800 MB for 50 MB corpus → safe on L4 (24 GB).
         """
-        data_np = np.frombuffer(data, dtype=np.uint8)   # zero-copy read-only view
-        L_total = len(data_np)
+        # Upload corpus once; reuse across all n values.
+        data_np = np.frombuffer(data, dtype=np.uint8)
+        data_t  = torch.from_numpy(data_np.copy()).to(self.device)   # (N,) uint8
+        L_total = len(data_t)
 
-        # We only need the top-K most frequent n-grams; skip rare ones early.
-        keep_k = (self.vocab_size - self.BYTE_FALLBACK_SIZE) * self.top_k_factor
+        if keep_k is None:
+            keep_k = (self.vocab_size - self.BYTE_FALLBACK_SIZE) * self.top_k_factor
 
         freq: dict[bytes, int] = {}
 
@@ -355,30 +374,41 @@ class ClusteringTokenizer:
             if L <= 0:
                 continue
 
-            # Strided view: (L, n) uint8 — no copy (shares memory with data_np)
-            ngrams_view = np.lib.stride_tricks.as_strided(
-                data_np, shape=(L, n), strides=(1, 1)
-            )
+            # ── Bitwise pack: each n-gram → one int64 key ──────────────────────
+            # keys[i] = data[i] | data[i+1]<<8 | ... | data[i+n-1]<<(8*(n-1))
+            # Little-endian so the first byte is the LSB — same as b'\xb1\xb2'.
+            # n ≤ 8 bytes → always fits in int64 (sign bit only set for n=8 if
+            # the 8th byte ≥ 128, but sort order is preserved because we only
+            # need consistent ordering, not numeric magnitude).
+            keys = data_t[:L].to(torch.int64)   # byte 0
+            for i in range(1, n):
+                keys = keys | (data_t[i : L + i].to(torch.int64) << (8 * i))
 
-            # Pack each n-gram into one uint64 key (little-endian, zero-padded).
-            # np.zeros + slice copy is cheaper than np.unique on a 2-D array
-            # because sorting uint64 is a 1-D radix sort vs lexicographic row sort.
-            packed = np.zeros((L, 8), dtype=np.uint8)
-            packed[:, :n] = ngrams_view          # one C-level memcpy
-            keys = packed.view(np.uint64).reshape(-1)   # (L,) uint64, same buffer
+            # ── GPU sort → run-length encoding ─────────────────────────────────
+            sorted_keys, _ = torch.sort(keys)
 
-            # C-level sort+count — fast even for 50 M entries
-            unique_keys, counts = np.unique(keys, return_counts=True)
+            # Mark positions where the value changes (run boundaries)
+            boundary = torch.empty(L + 1, dtype=torch.bool, device=self.device)
+            boundary[0]  = True
+            boundary[1:] = sorted_keys[1:] != sorted_keys[:-1]
+            boundary[L]  = True
 
-            # Pre-filter: keep only top-K before the Python loop
-            if len(counts) > keep_k:
-                top_idx    = np.argpartition(counts, -keep_k)[-keep_k:]
+            unique_keys = sorted_keys[boundary[:L]]   # (U,) — one entry per run
+            run_starts  = torch.where(boundary[:L])[0]
+            run_ends    = torch.where(boundary[1:])[0]
+            counts      = (run_ends - run_starts + 1).to(torch.int32)   # (U,)
+
+            # ── Top-K filter on GPU ─────────────────────────────────────────────
+            if counts.numel() > keep_k:
+                top_counts, top_idx = torch.topk(counts, keep_k)
                 unique_keys = unique_keys[top_idx]
-                counts      = counts[top_idx]
+                counts      = top_counts
 
-            # Python loop is now O(keep_k) ≈ 500 K, not O(unique n-grams) ≈ millions
-            for key_int, cnt in zip(unique_keys.tolist(), counts.tolist()):
-                bs = int(key_int).to_bytes(8, "little")[:n]
+            # ── CPU transfer + Python dict: only keep_k entries ────────────────
+            import struct
+            pack_q = struct.Struct("<q")   # little-endian signed int64
+            for key_int, cnt in zip(unique_keys.cpu().tolist(), counts.cpu().tolist()):
+                bs = pack_q.pack(key_int)[:n]
                 if bs in freq:
                     freq[bs] += cnt
                 else:
