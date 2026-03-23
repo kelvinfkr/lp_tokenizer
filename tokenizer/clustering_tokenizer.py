@@ -329,8 +329,10 @@ class ClusteringTokenizer:
           the resulting Python loop is over unique n-grams (≪ chunk size),
           not over every position in the corpus
         """
-        # Zero-copy view of the raw bytes buffer
-        data_t = torch.frombuffer(data, dtype=torch.uint8).to(self.device)
+        # np.frombuffer: zero-copy read-only view; copy() makes it writable so
+        # torch.from_numpy works without issues across PyTorch versions.
+        data_np = np.frombuffer(data, dtype=np.uint8).copy()
+        data_t  = torch.from_numpy(data_np).to(self.device)
         freq: dict[bytes, int] = {}
 
         # Process in chunks to cap GPU memory usage.
@@ -346,13 +348,18 @@ class ClusteringTokenizer:
 
             for chunk_start in range(0, L, CHUNK):
                 chunk_end = min(chunk_start + CHUNK, L)
-                # unfold is a strided view: shape (chunk_end-chunk_start, n), uint8
-                window = data_t[chunk_start : chunk_end + n - 1].unfold(0, n, 1)
+                # unfold returns a strided view: (C, n) uint8, C rows each n bytes.
+                # .contiguous() materialises the view so torch.unique can sort rows.
+                window = (
+                    data_t[chunk_start : chunk_end + n - 1]
+                    .unfold(0, n, 1)
+                    .contiguous()
+                )  # (C, n) uint8
 
-                # GPU sort + count; result has only unique rows
+                # GPU sort + count; returns only unique rows → small result
                 unique_rows, counts = torch.unique(window, dim=0, return_counts=True)
 
-                # CPU transfer is small: only unique rows, not the full window
+                # CPU transfer is only the unique rows, not the full window
                 for row, cnt in zip(unique_rows.cpu().tolist(), counts.cpu().tolist()):
                     key = bytes(row)
                     partial[key] = partial.get(key, 0) + cnt
