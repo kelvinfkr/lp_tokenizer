@@ -95,15 +95,25 @@ def compute_minhash_signatures_gpu(
     for ng_len, group in by_len.items():
         idxs  = [i for i, _ in group]
         cands = [c for _, c in group]
-        # Feature matrix: (B, ng_len) int64, feature = pos*256 + byte
-        feat = torch.tensor(
-            [[pos * 256 + byte for pos, byte in enumerate(c)] for c in cands],
-            dtype=torch.int64, device=device,
-        )  # (B, ng_len)
 
-        # Vectorised MinHash: (H, B, ng_len) → min over ng_len → (H, B) → (B, H)
-        hv = (a_t[:, None, None] * feat[None] + b_t[:, None, None]) % p
-        sigs[idxs] = hv.min(dim=2).values.T
+        # Inner batching: (H, B, ng_len) int64 uses H*B*ng_len*8 bytes.
+        # Cap at 512 MB to stay safe on 16 GB GPUs (T4/V100).
+        inner_bs = max(1, (512 * 1024 * 1024) // (NUM_HASHES * ng_len * 8))
+
+        for b_start in range(0, len(cands), inner_bs):
+            b_end  = min(b_start + inner_bs, len(cands))
+            i_idxs = idxs[b_start:b_end]
+            i_cands = cands[b_start:b_end]
+
+            # Feature matrix: (B, ng_len) int64, feature = pos*256 + byte
+            feat = torch.tensor(
+                [[pos * 256 + byte for pos, byte in enumerate(c)] for c in i_cands],
+                dtype=torch.int64, device=device,
+            )  # (B, ng_len)
+
+            # Vectorised MinHash: (H, B, ng_len) → min over ng_len → (B, H)
+            hv = (a_t[:, None, None] * feat[None] + b_t[:, None, None]) % p
+            sigs[i_idxs] = hv.min(dim=2).values.T
 
     return sigs   # (n, NUM_HASHES)
 
@@ -319,53 +329,60 @@ class ClusteringTokenizer:
 
     def _count_ngrams_gpu(self, data: bytes) -> dict[bytes, int]:
         """
-        Count byte n-gram frequencies using GPU sort (torch.unique).
+        Count byte n-gram frequencies using numpy (CPU).
 
-        Key improvements over the original:
-        - torch.frombuffer: zero-copy, avoids building a 50M-element Python list
-        - .unfold(0, n, 1): returns a strided view (no copy); dtype uint8 so
-          memory is (chunk, n) bytes instead of (L, n)*8 int64
-        - torch.unique(dim=0): GPU radix sort → counts only unique rows;
-          the resulting Python loop is over unique n-grams (≪ chunk size),
-          not over every position in the corpus
+        Why numpy instead of GPU here:
+        - For large n (n=7,8) most n-grams in a corpus are unique, so
+          torch.unique returns nearly as many rows as input → the subsequent
+          Python dict loop still iterates O(L) times per chunk.
+        - numpy np.unique on the full corpus at once is a single C-level
+          radix sort, faster than 13 round-trips (GPU sort + CPU transfer).
+        - We use np.argpartition to keep only the top-K candidates before
+          converting to Python bytes, so the final Python loop is O(K) not O(L).
+
+        Memory: (L, 8) uint8 ≈ corpus_size × 8 bytes  (≤ 400 MB for 50 MB corpus)
         """
-        # np.frombuffer: zero-copy read-only view; copy() makes it writable so
-        # torch.from_numpy works without issues across PyTorch versions.
-        data_np = np.frombuffer(data, dtype=np.uint8).copy()
-        data_t  = torch.from_numpy(data_np).to(self.device)
+        data_np = np.frombuffer(data, dtype=np.uint8)   # zero-copy read-only view
+        L_total = len(data_np)
+
+        # We only need the top-K most frequent n-grams; skip rare ones early.
+        keep_k = (self.vocab_size - self.BYTE_FALLBACK_SIZE) * self.top_k_factor
+
         freq: dict[bytes, int] = {}
 
-        # Process in chunks to cap GPU memory usage.
-        # At chunk=4M and n=8: (4M, 8) uint8 = 32 MB — safe on any GPU.
-        CHUNK = 4_000_000
-
         for n in range(self.min_ngram, self.max_ngram + 1):
-            L = len(data_t) - n + 1
+            L = L_total - n + 1
             if L <= 0:
                 continue
 
-            partial: dict[bytes, int] = {}
+            # Strided view: (L, n) uint8 — no copy (shares memory with data_np)
+            ngrams_view = np.lib.stride_tricks.as_strided(
+                data_np, shape=(L, n), strides=(1, 1)
+            )
 
-            for chunk_start in range(0, L, CHUNK):
-                chunk_end = min(chunk_start + CHUNK, L)
-                # unfold returns a strided view: (C, n) uint8, C rows each n bytes.
-                # .contiguous() materialises the view so torch.unique can sort rows.
-                window = (
-                    data_t[chunk_start : chunk_end + n - 1]
-                    .unfold(0, n, 1)
-                    .contiguous()
-                )  # (C, n) uint8
+            # Pack each n-gram into one uint64 key (little-endian, zero-padded).
+            # np.zeros + slice copy is cheaper than np.unique on a 2-D array
+            # because sorting uint64 is a 1-D radix sort vs lexicographic row sort.
+            packed = np.zeros((L, 8), dtype=np.uint8)
+            packed[:, :n] = ngrams_view          # one C-level memcpy
+            keys = packed.view(np.uint64).reshape(-1)   # (L,) uint64, same buffer
 
-                # GPU sort + count; returns only unique rows → small result
-                unique_rows, counts = torch.unique(window, dim=0, return_counts=True)
+            # C-level sort+count — fast even for 50 M entries
+            unique_keys, counts = np.unique(keys, return_counts=True)
 
-                # CPU transfer is only the unique rows, not the full window
-                for row, cnt in zip(unique_rows.cpu().tolist(), counts.cpu().tolist()):
-                    key = bytes(row)
-                    partial[key] = partial.get(key, 0) + cnt
+            # Pre-filter: keep only top-K before the Python loop
+            if len(counts) > keep_k:
+                top_idx    = np.argpartition(counts, -keep_k)[-keep_k:]
+                unique_keys = unique_keys[top_idx]
+                counts      = counts[top_idx]
 
-            for k, v in partial.items():
-                freq[k] = freq.get(k, 0) + v
+            # Python loop is now O(keep_k) ≈ 500 K, not O(unique n-grams) ≈ millions
+            for key_int, cnt in zip(unique_keys.tolist(), counts.tolist()):
+                bs = int(key_int).to_bytes(8, "little")[:n]
+                if bs in freq:
+                    freq[bs] += cnt
+                else:
+                    freq[bs] = cnt
 
         return freq
 
