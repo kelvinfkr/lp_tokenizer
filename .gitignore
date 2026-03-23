@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Generated data
+data/raw/
+data/bpe/
+data/clustering/
+
+# Experiment outputs
+experiments/out/
+
+# Model checkpoints (large)
+*.bin
+!data/clustering/tokenizer.bin
+
+# Build artifacts
+*.o
+*.so
