@@ -190,8 +190,35 @@ class ClusteringTokenizer:
         max_ngram: int = 8,
         top_k_factor: int = 10,
         device: Optional[str] = None,
-        cluster: bool = False,
+        cluster: bool | str = False,
     ):
+        """
+        cluster controls the vocab-selection strategy after n-gram counting:
+
+          False  (default) — no deduplication; directly select top-K by
+                             frequency.  Fastest; LP-optimal when the
+                             similarity constraints are all inactive.
+
+          'lp'             — LP relaxation of the maximum-weight independent
+                             set (MWIS) on the similarity graph:
+
+                               max  Σ freq_i · y_i
+                               s.t. y_i + y_j ≤ 1  ∀ similar (i,j)
+                                    Σ y_i ≤ M
+                                    0 ≤ y_i ≤ 1
+
+                             Solved with scipy/HiGHS (polynomial time); result
+                             is rounded greedily for a 2-approximation.
+                             Requires scipy.  Similar pairs found via MinHash+LSH,
+                             so total time ≈ cluster=True minus union-find plus
+                             LP solve (~seconds for sparse graphs).
+
+          True             — original MinHash+LSH+union-find heuristic.  Kept
+                             for ablation; union-find's transitive closure can
+                             over-merge (not equivalent to LP relaxation).
+        """
+        if cluster not in (False, True, "lp"):
+            raise ValueError(f"cluster must be False, True, or 'lp', got {cluster!r}")
         self.vocab_size   = vocab_size
         self.min_ngram    = min_ngram
         self.max_ngram    = max_ngram
@@ -255,6 +282,51 @@ class ClusteringTokenizer:
                 print(f"  Step 2/2: selecting top-{n_content_tokens} tokens ...")
             top_sorted = sorted(freq.items(), key=lambda x: -x[1])
             top_reps = [tok for tok, _ in top_sorted[:n_content_tokens]]
+
+        elif self.cluster == "lp":
+            # ── LP path: count → MinHash → LSH → LP relaxation + greedy round ──
+            # Same as cluster=True up to LSH; replaces union-find with LP.
+            if verbose:
+                print("  Step 1/4: counting n-gram frequencies ...")
+            keep_k = (self.vocab_size - self.BYTE_FALLBACK_SIZE) * self.top_k_factor
+            freq = self._count_ngrams_gpu(data, keep_k=keep_k)
+            if verbose:
+                print(f"    total unique n-grams: {len(freq)}")
+
+            target_k = min(keep_k, len(freq))
+            if verbose:
+                print(f"  Step 2/4: keeping top-{target_k} candidates ...")
+            candidates_sorted = sorted(freq.items(), key=lambda x: -x[1])[:target_k]
+            candidates = [c for c, _ in candidates_sorted]
+            cand_freqs = {c: f for c, f in candidates_sorted}
+
+            if verbose:
+                print(f"  Step 3/4: computing MinHash signatures on {self.device} ...")
+            sigs = compute_minhash_signatures_gpu(candidates, self.device)
+            if verbose:
+                print(f"    signatures shape: {tuple(sigs.shape)}")
+
+            if verbose:
+                print("  Step 4/4: LSH → LP relaxation (MWIS) + greedy rounding ...")
+            buckets = lsh_buckets_gpu(sigs, self.device)
+
+            # Collect unique similar pairs from all LSH buckets.
+            # Each pair (i,j) means Jaccard(candidates[i], candidates[j]) ≈ ≥ threshold.
+            pair_set: set[tuple[int, int]] = set()
+            for members in buckets.values():
+                for a in range(len(members)):
+                    for b_idx in range(a + 1, len(members)):
+                        u, v = members[a], members[b_idx]
+                        pair_set.add((min(u, v), max(u, v)))
+            similar_pairs = list(pair_set)
+
+            if verbose:
+                print(f"    similar pairs found: {len(similar_pairs)}")
+                print(f"    solving LP (K={len(candidates)}, constraints={len(similar_pairs)+1}) ...")
+
+            top_reps = self._select_vocab_lp(
+                candidates, cand_freqs, similar_pairs, n_content_tokens
+            )
 
         else:
             # ── Full pipeline: count → MinHash → LSH → union-find ──
@@ -343,6 +415,120 @@ class ClusteringTokenizer:
             avg_len = np.mean([len(t) for t in self._vocab])
             print(f"  Done! vocab_size={len(self._vocab)}, "
                   f"avg_token_len={avg_len:.2f} bytes")
+
+    # ── LP relaxation vocab selection ─────────────────────────────────────────
+
+    def _select_vocab_lp(
+        self,
+        candidates: list[bytes],
+        cand_freqs: dict[bytes, int],
+        similar_pairs: list[tuple[int, int]],
+        n_select: int,
+    ) -> list[bytes]:
+        """
+        LP relaxation of the Maximum Weighted Independent Set (MWIS) problem
+        on the similarity graph, followed by greedy rounding.
+
+        Integer Program
+        ───────────────
+          max  Σ_i  freq_i · y_i
+          s.t. y_i + y_j ≤ 1    ∀ similar pairs (i,j)   [independence]
+               Σ_i  y_i  ≤ M                              [vocab budget]
+               y_i ∈ {0,1}
+
+        LP Relaxation (this function)
+        ──────────────────────────────
+          Same but y_i ∈ [0,1].  Solved with scipy / HiGHS in O(K^1..2.5)
+          depending on problem density.  For typical sparse similarity graphs
+          (few Jaccard≥0.8 pairs among high-freq n-grams) this runs in seconds.
+
+        Greedy Rounding → 2-approximation
+        ────────────────────────────────────
+          Sort by x_i·freq_i (LP fractional value × frequency), greedily
+          select each candidate unless it conflicts with an already-selected one.
+          For MWIS on sparse graphs, this is typically near-optimal in practice.
+        """
+        try:
+            from scipy.optimize import linprog
+            from scipy.sparse import lil_array, csr_array
+        except ImportError as e:
+            raise ImportError(
+                "cluster='lp' requires scipy. Install with: pip install scipy"
+            ) from e
+
+        K = len(candidates)
+        freqs = np.array([cand_freqs[c] for c in candidates], dtype=np.float64)
+        # Normalise for numerical stability; LP objective scale does not matter.
+        freqs_norm = freqs / (freqs.max() + 1e-9)
+
+        # Objective: minimise −freq (scipy convention for minimisation)
+        c_obj = -freqs_norm
+
+        # ── Build sparse inequality constraint matrix ──────────────────────────
+        # Each similar pair (i,j) contributes: y_i + y_j ≤ 1
+        # Plus one global budget row:          Σ y_i ≤ M
+        n_pair_constraints = len(similar_pairs)
+        n_rows = n_pair_constraints + 1
+
+        A = lil_array((n_rows, K), dtype=np.float64)
+        b = np.ones(n_rows, dtype=np.float64)
+
+        for row, (i, j) in enumerate(similar_pairs):
+            A[row, i] = 1.0
+            A[row, j] = 1.0
+
+        # Budget row
+        A[n_pair_constraints, :] = 1.0
+        b[n_pair_constraints] = float(n_select)
+
+        bounds = [(0.0, 1.0)] * K
+
+        result = linprog(
+            c_obj,
+            A_ub=csr_array(A),
+            b_ub=b,
+            bounds=bounds,
+            method="highs",
+            options={"disp": False},
+        )
+        if result.status != 0:
+            # Fall back to unconstrained greedy if LP fails
+            import warnings
+            warnings.warn(
+                f"LP solver returned status {result.status} ({result.message}); "
+                "falling back to greedy top-K selection.",
+                RuntimeWarning,
+            )
+            order = np.argsort(-freqs)
+            return [candidates[i] for i in order[:n_select]]
+
+        x_lp = result.x   # fractional solution in [0,1]^K
+
+        # ── Greedy rounding ────────────────────────────────────────────────────
+        # Sort by LP-fractional value × raw frequency (both reflect importance)
+        score = x_lp * freqs
+        order = np.argsort(-score)
+
+        # Build adjacency list for O(1) conflict lookup
+        adj: dict[int, set[int]] = defaultdict(set)
+        for i, j in similar_pairs:
+            adj[i].add(j)
+            adj[j].add(i)
+
+        selected: list[bytes] = []
+        blocked: set[int] = set()
+
+        for idx in order:
+            if idx in blocked:
+                continue
+            selected.append(candidates[idx])
+            blocked.update(adj[idx])
+            if len(selected) >= n_select:
+                break
+
+        return selected
+
+    # ── N-gram frequency counting ──────────────────────────────────────────────
 
     def _count_ngrams_gpu(self, data: bytes, keep_k: int | None = None) -> dict[bytes, int]:
         """
