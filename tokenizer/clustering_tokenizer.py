@@ -66,44 +66,44 @@ def _ngram_to_feature_indices(ngram: bytes) -> np.ndarray:
 def compute_minhash_signatures_gpu(
     candidates: list[bytes],
     device: torch.device,
-    batch_size: int = 4096,
+    batch_size: int = 4096,  # kept for API compat, not used
 ) -> torch.Tensor:
     """
     Compute MinHash signatures for all candidates on GPU.
 
     Returns tensor of shape (len(candidates), NUM_HASHES), dtype int64.
-    Uses the sparse feature matrix × random-projection approach.
+    Groups candidates by length so each group is one batched matrix op,
+    reducing kernel launches from O(n_candidates) to O(unique_lengths).
     """
     n = len(candidates)
-    # Hash parameters on CPU (small)
     rng = np.random.default_rng(0)
-    a = rng.integers(1, _LARGE_PRIME, size=NUM_HASHES, dtype=np.int64)
+    a  = rng.integers(1, _LARGE_PRIME, size=NUM_HASHES, dtype=np.int64)
     b_ = rng.integers(0, _LARGE_PRIME, size=NUM_HASHES, dtype=np.int64)
 
-    a_t  = torch.tensor(a,  dtype=torch.int64, device=device)   # (H,)
-    b_t  = torch.tensor(b_, dtype=torch.int64, device=device)   # (H,)
-    p    = _LARGE_PRIME
+    a_t = torch.tensor(a,  dtype=torch.int64, device=device)   # (H,)
+    b_t = torch.tensor(b_, dtype=torch.int64, device=device)   # (H,)
+    p   = _LARGE_PRIME
 
     sigs = torch.zeros(n, NUM_HASHES, dtype=torch.int64, device=device)
 
-    for start in range(0, n, batch_size):
-        end   = min(start + batch_size, n)
-        batch = candidates[start:end]
-        m     = end - start
+    # Group by length: same-length n-grams have identical feature structure
+    # → one batched (H, B, length) computation per group
+    by_len: dict[int, list[tuple[int, bytes]]] = defaultdict(list)
+    for i, c in enumerate(candidates):
+        by_len[len(c)].append((i, c))
 
-        # Build feature index lists for each candidate in batch
-        feat_lists = [_ngram_to_feature_indices(c) for c in batch]
+    for ng_len, group in by_len.items():
+        idxs  = [i for i, _ in group]
+        cands = [c for _, c in group]
+        # Feature matrix: (B, ng_len) int64, feature = pos*256 + byte
+        feat = torch.tensor(
+            [[pos * 256 + byte for pos, byte in enumerate(c)] for c in cands],
+            dtype=torch.int64, device=device,
+        )  # (B, ng_len)
 
-        # For each candidate, compute minhash over its feature set
-        # Vectorise across the NUM_HASHES dimension:
-        #   sig[h] = min_{x in S}  (a[h]*x + b[h]) % p
-        for i, feats in enumerate(feat_lists):
-            if len(feats) == 0:
-                continue
-            x_t = torch.tensor(feats, dtype=torch.int64, device=device)  # (F,)
-            # hash values for all hash functions: (H, F)
-            hv = (a_t.unsqueeze(1) * x_t.unsqueeze(0) + b_t.unsqueeze(1)) % p
-            sigs[start + i] = hv.min(dim=1).values
+        # Vectorised MinHash: (H, B, ng_len) → min over ng_len → (H, B) → (B, H)
+        hv = (a_t[:, None, None] * feat[None] + b_t[:, None, None]) % p
+        sigs[idxs] = hv.min(dim=2).values.T
 
     return sigs   # (n, NUM_HASHES)
 
@@ -112,23 +112,50 @@ def lsh_buckets_gpu(sigs: torch.Tensor, device: torch.device) -> dict[tuple, lis
     """
     Locality-Sensitive Hashing: group candidate indices into buckets.
 
-    For each of the LSH_BANDS bands, hash the (LSH_ROWS,) sub-vector to a bucket key.
-    Two candidates share a bucket if ANY band hash matches.
+    For each of the LSH_BANDS bands, compute a polynomial rolling hash of the
+    (LSH_ROWS,) sub-vector on GPU, then sort + segment to find collisions.
+    Only candidates inside ≥2-element segments are transferred to CPU.
+
     Returns dict: bucket_key → [candidate_indices].
     """
     n = sigs.shape[0]
-    # sigs: (n, NUM_HASHES) → reshape to (n, LSH_BANDS, LSH_ROWS)
-    s = sigs.view(n, LSH_BANDS, LSH_ROWS)   # still on GPU
+    s = sigs.view(n, LSH_BANDS, LSH_ROWS)   # (n, 16, 8) int64, on GPU
+    p = _LARGE_PRIME
 
     buckets: dict[tuple, list[int]] = defaultdict(list)
 
     for band in range(LSH_BANDS):
-        band_vecs = s[:, band, :].cpu().numpy()   # (n, LSH_ROWS) int64
-        for idx, vec in enumerate(band_vecs):
-            key = (band,) + tuple(vec.tolist())
-            buckets[key].append(idx)
+        # Polynomial rolling hash for this band: one pass over LSH_ROWS
+        col = s[:, band, 0].clone()                         # (n,) int64
+        for r in range(1, LSH_ROWS):
+            col = (col * 1_000_003 + s[:, band, r]) % p    # (n,) int64
 
-    # Keep only buckets with ≥2 candidates
+        # Sort by hash value
+        sorted_vals, sorted_idx = torch.sort(col)           # (n,), (n,)
+
+        # Find segment boundaries fully on GPU
+        diff = torch.empty(n + 1, dtype=torch.bool, device=device)
+        diff[0]    = True
+        diff[1:-1] = sorted_vals[1:] != sorted_vals[:-1]
+        diff[-1]   = True
+        seg_starts = torch.where(diff[:-1])[0]              # (S,)
+        seg_ends   = torch.where(diff[1:])[0]               # (S,)
+
+        # Keep only segments with ≥2 elements before transferring to CPU
+        sizes = seg_ends - seg_starts + 1
+        mask  = sizes >= 2
+        if not mask.any():
+            continue
+
+        starts_cpu = seg_starts[mask].cpu().tolist()
+        ends_cpu   = seg_ends[mask].cpu().tolist()
+        vals_cpu   = sorted_vals[seg_starts[mask]].cpu().tolist()
+        idx_cpu    = sorted_idx.cpu().tolist()
+
+        for s_i, e_i, val in zip(starts_cpu, ends_cpu, vals_cpu):
+            key = (band, val)
+            buckets[key].extend(idx_cpu[s_i : e_i + 1])
+
     return {k: v for k, v in buckets.items() if len(v) >= 2}
 
 
@@ -291,26 +318,47 @@ class ClusteringTokenizer:
                   f"avg_token_len={avg_len:.2f} bytes")
 
     def _count_ngrams_gpu(self, data: bytes) -> dict[bytes, int]:
-        """Count byte n-gram frequencies using GPU-accelerated sorting."""
-        data_t = torch.tensor(
-            list(data), dtype=torch.uint8, device=self.device
-        )
+        """
+        Count byte n-gram frequencies using GPU sort (torch.unique).
+
+        Key improvements over the original:
+        - torch.frombuffer: zero-copy, avoids building a 50M-element Python list
+        - .unfold(0, n, 1): returns a strided view (no copy); dtype uint8 so
+          memory is (chunk, n) bytes instead of (L, n)*8 int64
+        - torch.unique(dim=0): GPU radix sort → counts only unique rows;
+          the resulting Python loop is over unique n-grams (≪ chunk size),
+          not over every position in the corpus
+        """
+        # Zero-copy view of the raw bytes buffer
+        data_t = torch.frombuffer(data, dtype=torch.uint8).to(self.device)
         freq: dict[bytes, int] = {}
 
-        for n in range(self.min_ngram, self.max_ngram + 1):
-            if len(data_t) < n:
-                continue
-            # Extract all n-grams as rows of a 2D tensor
-            L = len(data_t) - n + 1
-            idx = torch.arange(L, device=self.device).unsqueeze(1) + \
-                  torch.arange(n, device=self.device).unsqueeze(0)   # (L, n)
-            ngrams_t = data_t[idx]   # (L, n) uint8
+        # Process in chunks to cap GPU memory usage.
+        # At chunk=4M and n=8: (4M, 8) uint8 = 32 MB — safe on any GPU.
+        CHUNK = 4_000_000
 
-            # Use numpy for hashing (GPU→CPU once per n)
-            ngrams_np = ngrams_t.cpu().numpy()   # (L, n)
-            for row in ngrams_np:
-                key = bytes(row)
-                freq[key] = freq.get(key, 0) + 1
+        for n in range(self.min_ngram, self.max_ngram + 1):
+            L = len(data_t) - n + 1
+            if L <= 0:
+                continue
+
+            partial: dict[bytes, int] = {}
+
+            for chunk_start in range(0, L, CHUNK):
+                chunk_end = min(chunk_start + CHUNK, L)
+                # unfold is a strided view: shape (chunk_end-chunk_start, n), uint8
+                window = data_t[chunk_start : chunk_end + n - 1].unfold(0, n, 1)
+
+                # GPU sort + count; result has only unique rows
+                unique_rows, counts = torch.unique(window, dim=0, return_counts=True)
+
+                # CPU transfer is small: only unique rows, not the full window
+                for row, cnt in zip(unique_rows.cpu().tolist(), counts.cpu().tolist()):
+                    key = bytes(row)
+                    partial[key] = partial.get(key, 0) + cnt
+
+            for k, v in partial.items():
+                freq[k] = freq.get(k, 0) + v
 
         return freq
 
