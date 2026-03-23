@@ -88,11 +88,11 @@ def prepare_clustering(
         tok.load(str(tok_path))
     else:
         corpus = load_training_corpus(raw_dir, max_mb=train_mb)
-        kwargs: dict = {"vocab_size": vocab_size, "verbose": True}
+        kwargs: dict = {"vocab_size": vocab_size}
         if device:
             kwargs["device"] = device
         tok = ClusteringTokenizer(**kwargs)
-        tok.train(corpus)
+        tok.train(corpus, verbose=True)
         tok.save(str(tok_path))
 
     print(f"[prepare_clustering] vocab_size={tok.vocab_size}, eot={tok.eot_token}")
