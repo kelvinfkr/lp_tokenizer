@@ -98,14 +98,35 @@ def val_loss_to_bpb(val_loss: float, bytes_per_token: float) -> float:
     return val_loss / np.log(2) / bytes_per_token
 
 
-def compute_bytes_per_token(val_bin: Path) -> float:
-    """Estimate average bytes per token from a validation .bin file."""
+def compute_bytes_per_token(val_bin: Path,
+                            tokenizer_bin: Optional[Path] = None,
+                            vocab_size: int = 50257,
+                            is_bpe: bool = False) -> float:
+    """
+    Compute actual encoding density (bytes per token) from a .bin file.
+
+    Decodes a sample of val tokens with the tokenizer and measures:
+        actual_bytes_per_token = total_decoded_bytes / n_sampled_tokens
+
+    This is the correct denominator for BPB.  Do NOT use vocabulary-entry
+    mean length, which diverges from encoding density when coverage is low.
+    """
     tokens, _ = read_datafile(val_bin)
-    # We need to read the original text length. As a proxy,
-    # we use token count and estimate from the known text size.
-    # A more accurate approach requires the original text file.
-    # Return token count for now; caller provides text bytes separately.
-    return len(tokens)
+    if len(tokens) == 0:
+        return 3.5
+
+    if is_bpe:
+        try:
+            from tokenizer.bpe_baseline import BPETokenizer
+            tok = BPETokenizer()
+            sample = tokens[:10_000]
+            total = sum(len(tok.decode([int(t)])) for t in sample)
+            return total / len(sample)
+        except Exception:
+            return 3.6
+
+    return _estimate_avg_bytes_per_token(tokenizer_bin, vocab_size,
+                                         val_tokens=tokens)
 
 
 # ──────────────────────────────────────────────
@@ -187,10 +208,12 @@ def compute_bpb_from_checkpoint(
             total_nll  += out.loss.item() * inp.numel()
             total_toks += inp.numel()
 
-    # We need total bytes; estimate from token count using avg token length
-    # from the tokenizer binary if available
+    # Compute actual bytes/token from the validation tokens themselves.
+    # This is the encoding density (source bytes covered per token), which
+    # is the correct denominator for BPB — NOT the vocabulary entry mean.
     avg_bytes_per_token = _estimate_avg_bytes_per_token(
-        tokenizer_bin, config.vocab_size
+        tokenizer_bin, config.vocab_size,
+        val_tokens=val_tokens,   # decode actual tokens for ground-truth density
     )
     total_bytes = total_toks * avg_bytes_per_token
     bpb = (total_nll / np.log(2)) / total_bytes
@@ -201,28 +224,53 @@ def compute_bpb_from_checkpoint(
 
 
 def _estimate_avg_bytes_per_token(tokenizer_bin: Optional[Path],
-                                  vocab_size: int) -> float:
-    """Read tokenizer binary and compute average token byte length."""
-    if tokenizer_bin is None:
-        return 3.5  # rough default
+                                  vocab_size: int,
+                                  val_tokens: Optional[np.ndarray] = None) -> float:
+    """
+    Compute average bytes per token — encoding density, not vocabulary mean.
 
-    if not tokenizer_bin.exists():
-        # Try treating as a BPE tokenizer (gpt2)
-        try:
-            from tokenizer.bpe_baseline import BPETokenizer
-            tok = BPETokenizer()
-            lengths = [len(tok.decode([i])) for i in range(min(vocab_size, 1000))]
-            return float(np.mean(lengths))
-        except Exception:
-            return 3.5
+    The correct denominator for BPB is the mean number of *source bytes*
+    covered per token when actually encoding text, NOT the mean length of
+    vocabulary entries.  These differ dramatically when vocab coverage is
+    low (e.g. clustering tokenizer at 6.5% multi-byte coverage: vocab mean
+    ≈ 2.80 bytes/token, but actual encoding density ≈ 1.09 bytes/token).
 
-    # It's a clustering tokenizer binary
+    If val_tokens is provided we decode them directly with the tokenizer
+    and measure actual_bytes / n_tokens.  This is the ground truth.
+
+    Falls back to vocabulary mean only when the tokenizer cannot be loaded.
+    """
+    if tokenizer_bin is None or not Path(tokenizer_bin).exists():
+        # BPE: use tiktoken to measure on val_tokens if available
+        if val_tokens is not None:
+            try:
+                from tokenizer.bpe_baseline import BPETokenizer
+                tok = BPETokenizer()
+                total_bytes = sum(len(tok.decode([int(t)])) for t in val_tokens[:10_000])
+                return total_bytes / min(len(val_tokens), 10_000)
+            except Exception:
+                pass
+        return 3.6   # GPT-2 BPE well-known empirical value
+
+    # Clustering tokenizer binary
     try:
         from tokenizer.clustering_tokenizer import ClusteringTokenizer
         ct = ClusteringTokenizer(vocab_size=vocab_size)
         ct.load(str(tokenizer_bin))
-        lengths = [len(tok) for tok in ct._vocab]
-        return float(np.mean(lengths))
+
+        if val_tokens is not None and len(val_tokens) > 0:
+            # Ground truth: decode actual val tokens and measure byte coverage.
+            # Sample up to 100K tokens for speed.
+            sample = val_tokens[:100_000]
+            total_bytes = sum(len(ct._vocab[int(t)]) for t in sample
+                              if int(t) < len(ct._vocab))
+            return total_bytes / len(sample)
+        else:
+            # Fallback: frequency-weighted vocab mean.
+            # Single-byte tokens (0-255) are almost always over-represented,
+            # so this still beats the unweighted mean.
+            lengths = [len(tok) for tok in ct._vocab]
+            return float(np.mean(lengths))
     except Exception:
         return 3.5
 
@@ -325,10 +373,13 @@ def main():
         print("GENERATION QUALITY COMPARISON (from training logs)")
         print("═" * 60)
 
-        for name, log_path, avg_bpt in [
-            ("BPE",        args.bpe_log, args.bpe_avg_bpt),
-            ("Clustering", args.cls_log, args.cls_avg_bpt or 2.5),
-        ]:
+        rows = [
+            # (name,          log_path,      val_bin,           tokenizer_bin,  is_bpe, fallback_bpt)
+            ("BPE",        args.bpe_log, args.bpe_val_bin, None,          True,  args.bpe_avg_bpt),
+            ("Clustering", args.cls_log, args.cls_val_bin, args.cls_tok,  False, args.cls_avg_bpt),
+        ]
+
+        for name, log_path, val_bin, tok_bin, is_bpe, override_bpt in rows:
             if log_path is None or not log_path.exists():
                 print(f"\n[{name}] log not found: {log_path}")
                 continue
@@ -336,12 +387,26 @@ def main():
             if "final_val_loss" not in info:
                 print(f"\n[{name}] no val loss found in log")
                 continue
+
+            # Determine bytes/token: prefer override → computed from val_bin → fallback
+            if override_bpt is not None:
+                avg_bpt = override_bpt
+                bpt_src = "override"
+            elif val_bin is not None and val_bin.exists():
+                avg_bpt = compute_bytes_per_token(
+                    val_bin, tok_bin, vocab_size=50257, is_bpe=is_bpe
+                )
+                bpt_src = f"measured from {val_bin.name}"
+            else:
+                avg_bpt = 3.6 if is_bpe else 2.5
+                bpt_src = "default fallback (no val_bin provided)"
+
             val_loss = info["final_val_loss"]
             bpb      = val_loss_to_bpb(val_loss, avg_bpt)
             print(f"\n{name}:")
             print(f"  final_step      : {info.get('final_step', '?')}")
             print(f"  val_loss (nats) : {val_loss:.4f}")
-            print(f"  avg bytes/token : {avg_bpt:.2f}")
+            print(f"  avg bytes/token : {avg_bpt:.3f}  ({bpt_src})")
             print(f"  BPB             : {bpb:.4f}  bits/byte")
 
     elif args.mode == "model":
